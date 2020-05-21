@@ -1,6 +1,7 @@
 #include "generic_chunk.h"
 #include "chunk.h"
 #include "compressed_chunk.h"
+#include "rax_chunk.h"
 #include "rmutil/alloc.h"
 
 static ChunkFuncs regChunk = {
@@ -38,8 +39,27 @@ static ChunkFuncs comprChunk = {
     .GetFirstTimestamp = Compressed_GetFirstTimestamp
 };
 
+static ChunkFuncs raxChunk = {
+    .NewChunk = RaxC_NewChunk,
+    .FreeChunk = RaxC_FreeChunk,
+
+    .AddSample = RaxC_AddSample,
+
+    .NewChunkIterator = RaxC_NewChunkIterator,
+    .FreeChunkIterator = RaxC_FreeChunkIterator,
+    .ChunkIteratorGetNext = RaxC_ChunkIteratorGetNext,
+    /*** Reverse iteration is on temporary decompressed chunk ***/
+    .ChunkIteratorGetPrev = RaxC_ChunkIteratorGetPrev,
+
+    .GetChunkSize = RaxC_GetChunkSize,
+    .GetNumOfSample = RaxC_NumOfSample,
+    .GetLastTimestamp = RaxC_GetLastTimestamp,
+    .GetFirstTimestamp = RaxC_GetFirstTimestamp
+};
+
 ChunkFuncs *GetChunkClass(CHUNK_TYPES_T chunkType) {
   switch (chunkType) {
+    case CHUNK_RAX:         return &raxChunk;
     case CHUNK_REGULAR:     return &regChunk;
     case CHUNK_COMPRESSED:  return &comprChunk;
   }

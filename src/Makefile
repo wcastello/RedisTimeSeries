@@ -101,6 +101,7 @@ _SOURCES=\
 	indexer.c \
 	module.c \
 	parse_policies.c \
+	rax_chunk.c \
 	rdb.c \
 	tsdb.c
 

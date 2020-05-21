@@ -8,6 +8,7 @@
 
 #include <sys/types.h>
 #include <stdbool.h>
+#include "redismodule.h"
 
 #define TRUE 1
 #define FALSE 0
@@ -52,5 +53,7 @@ typedef enum {
   CR_ERR = 1,   // RM_ERR
   CR_END = 2  
 } ChunkResult;
+
+RedisModuleCtx *RTS_GlobalRedisCtx;
 
 #endif

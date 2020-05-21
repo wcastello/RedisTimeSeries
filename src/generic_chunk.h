@@ -22,7 +22,8 @@ typedef void ChunkIter_t;
 
 typedef enum {
     CHUNK_REGULAR,
-    CHUNK_COMPRESSED 
+    CHUNK_COMPRESSED, 
+    CHUNK_RAX
 } CHUNK_TYPES_T;
 
 typedef struct ChunkFuncs {
