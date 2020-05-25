@@ -42,7 +42,11 @@ ChunkResult RaxC_AddSample(Chunk_t *chunk, Sample *sample) {
 
   Sample *raxSample = (Sample *)malloc(sizeof(*raxSample));
   *raxSample = *sample;
-  
+  if (RedisModule_DictSize(raxC->samples) == 0) {
+    raxC->firstTS = sample->timestamp;
+  }
+  raxC->lastTS = sample->timestamp;
+
   timestamp_t rax_key;
   seriesEncodeTimestamp(&rax_key, sample->timestamp);
   if (RedisModule_DictSetC(raxC->samples, &rax_key, sizeof(rax_key), raxSample) != REDISMODULE_OK) {
@@ -58,24 +62,12 @@ u_int64_t RaxC_NumOfSample(Chunk_t *chunk) {
 
 timestamp_t RaxC_GetLastTimestamp(Chunk_t *chunk) {
   RaxChunk *raxC = (RaxChunk *)chunk;
-  RedisModule_DictIteratorReseekC(raxC->dictIter, "$", NULL, 0);
-  Sample *sample;
-  RedisModule_DictNextC(raxC->dictIter, NULL, (void **)&sample);
-  if (sample == NULL) {
-    return -1;
-  }
-  return sample->timestamp;
+  return raxC->lastTS;
 }
 
 timestamp_t RaxC_GetFirstTimestamp(Chunk_t *chunk) {
-    RaxChunk *raxC = (RaxChunk *)chunk;
-  RedisModule_DictIteratorReseekC(raxC->dictIter, "^", NULL, 0);
-  Sample *sample;
-  RedisModule_DictNextC(raxC->dictIter, NULL, (void **)&sample);
-  if (sample == NULL) {
-    return -1;
-  }
-  return sample->timestamp;
+  RaxChunk *raxC = (RaxChunk *)chunk;
+  return raxC->firstTS;
 }
 
 ChunkIter_t *RaxC_NewChunkIterator(Chunk_t *chunk, bool rev) {

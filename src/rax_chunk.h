@@ -15,6 +15,8 @@ typedef struct RaxChunk {
   short max_samples;
   RedisModuleDict *samples;
   RedisModuleDictIter *dictIter;
+  timestamp_t firstTS;
+  timestamp_t lastTS;
 } RaxChunk;
 
 typedef struct RaxChunkIterator {
