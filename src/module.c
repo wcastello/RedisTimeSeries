@@ -414,7 +414,7 @@ static void handleCompaction(RedisModuleCtx *ctx,
         rule->startCurrentTimeBucket = currentTimestamp;
         RedisModule_CloseKey(key);
     }
-    rule->aggClass->appendValue(rule->aggContext, value);
+    rule->aggClass->appendValue(rule->aggContext, value, timestamp);
 }
 
 static int internalAdd(RedisModuleCtx *ctx,

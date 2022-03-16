@@ -39,6 +39,26 @@ typedef struct AvgContext
     bool isOverflow;
 } AvgContext;
 
+typedef struct WeightData
+{
+    double weightSum;
+    timestamp_t prevPrevTS;
+    timestamp_t prevTS;
+    double prevValue;
+    timestamp_t bucketStartTS;
+    timestamp_t bucketEndTS;
+    bool is_first_bucket;
+    bool is_last_ts_handled;
+    int64_t weight_cnt;
+    int64_t weight_sum;
+} WeightData;
+
+typedef struct WAvgContext
+{
+    AvgContext avgContext;
+    WeightData weightData;
+} WAvgContext;
+
 typedef struct StdContext
 {
     double sum;
@@ -85,11 +105,15 @@ err:
     return TSDB_ERROR;
 }
 
-void *AvgCreateContext() {
-    AvgContext *context = (AvgContext *)malloc(sizeof(AvgContext));
+static inline void _AvgInitContext(AvgContext *context) {
     context->cnt = 0;
     context->val = 0;
     context->isOverflow = false;
+}
+
+void *AvgCreateContext() {
+    AvgContext *context = (AvgContext *)malloc(sizeof(AvgContext));
+    _AvgInitContext(context);
     return context;
 }
 
@@ -100,7 +124,7 @@ bool hasLongDouble = sizeof(long double) > 8;
 bool hasLongDouble = false;
 #endif
 
-void AvgAddValue(void *contextPtr, double value) {
+void AvgAddValue(void *contextPtr, double value, __attribute__((unused)) timestamp_t ts) {
     AvgContext *context = (AvgContext *)contextPtr;
     context->cnt++;
 
@@ -145,10 +169,7 @@ int AvgFinalize(void *contextPtr, double *value) {
 }
 
 void AvgReset(void *contextPtr) {
-    AvgContext *context = (AvgContext *)contextPtr;
-    context->val = 0;
-    context->cnt = 0;
-    context->isOverflow = false;
+    _AvgInitContext(contextPtr);
 }
 
 void AvgWriteContext(void *contextPtr, RedisModuleIO *io) {
@@ -171,6 +192,221 @@ err:
     return TSDB_ERROR;
 }
 
+static inline void _WAvginitContext(WAvgContext *context) {
+    _AvgInitContext(&context->avgContext);
+    context->weightData.weightSum = 0;
+    context->weightData.prevPrevTS;
+    context->weightData.prevTS = DC;    // Just an arbitrary value
+    context->weightData.prevValue = DC; // Just an arbitrary value
+    context->weightData.bucketStartTS;
+    context->weightData.bucketEndTS;
+    context->weightData.is_first_bucket = true;
+    context->weightData.is_last_ts_handled = false;
+    context->weightData.weight_cnt = 0;
+    context->weightData.weight_sum = 0;
+}
+
+void *WAvgCreateContext() {
+    WAvgContext *context = (WAvgContext *)malloc(sizeof(WAvgContext));
+    _WAvginitContext(context);
+    return context;
+}
+
+static inline void _update_wavgContext(WAvgContext *wcontext, const double *value, const timestamp_t *ts) {
+    wcontext->weightData.prevPrevTS = wcontext->weightData.prevTS;
+    wcontext->weightData.prevValue = *value;
+    wcontext->weightData.prevTS = *ts;
+}
+
+void WAvgAddBucketParams(void *contextPtr, timestamp_t bucketStartTS, timestamp_t bucketEndTS) {
+    WAvgContext *context = (WAvgContext *)contextPtr;
+    context->weightData.bucketStartTS = bucketStartTS;
+    context->weightData.bucketEndTS = bucketEndTS;
+}
+
+void WAvgAddPrevBucketLastSample(void *contextPtr, double value, timestamp_t ts) {
+    WAvgContext *wcontext = (WAvgContext *)contextPtr;
+    _update_wavgContext(&value, &ts);
+    wcontext->weightData.is_first_bucket = false;
+}
+
+void WAvgAddValue(void *contextPtr, double value, timestamp_t ts) {
+    WAvgContext *wcontext = (WAvgContext *)contextPtr;
+    AvgContext *context = &wcontext->avgContext;
+    const int64_t *weightCnt = &wcontext->weightData.weight_cnt;
+    ++(*weightCnt);
+    const timestamp_t *prevTS = wcontext->weightData.prevTS;
+    const double *prev_value = wcontext->weightData.prevValue;
+    const timestamp_t time_delta = ts - (*prevTS);
+    const double half_time_delta = time_delta/2.0;
+    const bool *is_first_bucket = &wcontext->weightData.is_first_bucket;
+    const timestamp_t *startTS =  &wcontext->weightData.bucketStartTS;
+    double weight;
+
+    // add prev value with it's 2nd weight and add current value with it's first weight
+
+    if((*weightCnt) == 1) { // First sample in bucket
+        if(!(*is_first_bucket)) {
+            if((*prevTS) + half_time_delta <= (*startTS)) {
+                // prev_ts --- --- half_way --- bucket_start --- fisrt_ts
+                weight = (ts - (*startTS));
+                context->weightData.weight_sum += weight;
+                AvgAddValue(context, value*weight, DC);
+            } else {
+                // prev_ts --- bucket_start --- half_way --- --- fisrt_ts
+                context->weightData.weight_sum += half_time_delta;
+                AvgAddValue(context, value*half_time_delta, DC);
+                ++(*weightCnt); // inc the cnt one more time for the 2nd weight
+                weight = (*prevTS) + half_time_delta - (*startTS);
+                context->weightData.weight_sum += weight;
+                AvgAddValue(context, (*prev_value)*weight, DC);
+            }
+        }
+        // else: cur sample is the first in the series,
+        // assume the delta from the prev sample is same as the delta from next sample
+        // will be handled on next sample
+
+        _update_wavgContext(wcontext, &value, &ts);
+        return;
+    } else if(unlikely((*weightCnt) == 2 && (*is_first_bucket))) {
+        // 2nd sample in bucket and first bucket in the series
+        // extrapolate the weight of the 1st sample to be time_delta
+        // weightCnt already incremented on prev sample
+        double weight = min(half_time_delta, (*prevTS) - (*startTS)) + half_time_delta;
+        context->weightData.weight_sum += weight;
+        AvgAddValue(context, (*prev_value)*weight, DC);
+    } else {
+        ++(*weightCnt);
+        context->weightData.weight_sum += half_time_delta;
+        // add prev value with it's 2nd weight
+        AvgAddValue(context, (*prev_value)*half_time_delta, DC);
+    }
+
+    // add cur value with it's 1st weight
+    // wt = (t(k) - t(k - 1))/2)
+    context->weightData.weight_sum += half_time_delta;
+    AvgAddValue(context, value*half_time_delta, 0);
+
+    _update_wavgContext(wcontext, &value, &ts);
+}
+
+void WAvgAddNextBucketFirstSample(void *contextPtr, double value, timestamp_t ts) {
+    WAvgContext *wcontext = (WAvgContext *)contextPtr;
+    AvgContext *context = &wcontext->avgContext;
+    const int64_t *weightCnt = &wcontext->weightData.weight_cnt;
+    ++(*weightCnt);
+    const timestamp_t *prevTS = wcontext->weightData.prevTS;
+    const double *prev_value = wcontext->weightData.prevValue;
+    const timestamp_t time_delta = ts - (*prevTS);
+    const double half_time_delta = time_delta/2.0;
+    const bool *is_first_bucket = &wcontext->weightData.is_first_bucket;
+    const timestamp_t *startTS =  &wcontext->weightData.bucketStartTS;
+    const timestamp_t *endTS =  &wcontext->weightData.bucketEndTS;
+    double weight;
+
+    if(unlikely((*weightCnt) == 2 && (*is_first_bucket))) {
+        // Only 1 sample in bucket and first in the series
+        // extrapolate the 1st weight of the 1st sample to be time_delta
+        // weightCnt already incremented on prev sample
+        weight = min(half_time_delta, (*prevTS) - (*startTS));
+        context->weightData.weight_sum += weight;
+        AvgAddValue(context, (*prev_value)*weight, DC);
+    }
+
+    // add the 2nd weight of prev sample
+    if((*prevTS) + half_time_delta >= (*endTS)) {
+        // last_ts --- bucket_end --- half_way --- --- next_ts
+        weight = (*endTS) - (*prevTS);
+        context->weightData.weight_sum += weight;
+        AvgAddValue(context, prev_value*weight, DC);
+    } else {
+        // last_ts --- --- half_way --- bucket_end --- next_ts
+        context->weightData.weight_sum += half_time_delta;
+        AvgAddValue(context, prev_value*half_time_delta, DC);
+        ++(*weightCnt);
+        weight = (*endTS) - ((*prevTS) + half_time_delta);
+        context->weightData.weight_sum += weight;
+        AvgAddValue(context, value*weight, DC);
+    }
+
+    context->weightData.is_last_ts_handled = true;
+}
+
+int WAvgFinalize(void *contextPtr, double *value) {
+    WAvgContext *wcontext = (WAvgContext *)contextPtr;
+    AvgContext *context = &wcontext->avgContext;
+    const int64_t *weightCnt = &wcontext->weightData.weight_cnt;
+
+    if(!context->weightData.is_last_ts_handled) {
+        ++(*weightCnt);
+        if(unlikely((*weightCnt) == 2 && (*is_first_bucket))) {
+            // Only 1 sample in bucket and that's the only sample in the series
+            // don't use weights at all
+            (*weightCnt) = 0;
+            context->weightData.weight_sum = 0;
+            AvgAddValue(context, wcontext->weightData.prevValue, DC);
+        } else {
+            // This is the last bucket in the series
+            // extrapolate the weight of the prev sample to be the prev time_delta
+            const timestamp_t *prevTS = wcontext->weightData.prevTS;
+            const timestamp_t *endTS =  &wcontext->weightData.bucketEndTS;
+            const timestamp_t time_delta = (*prevTS) - wcontext->weightData.prevPrevTS;
+            const double half_time_delta = time_delta/2.0;
+            double weight = min(half_time_delta, (*endTS) - (*prevTS));
+            context->weightData.weight_sum += weight;
+            AvgAddValue(context, wcontext->weightData.prevValue*weight, DC);
+        }
+    }
+
+    if(*weightCnt > 0) {
+        // Normalizing the weighting for each time by dividing each weight by the mean of all weights 
+        const double avg_weight = context->weightData.weight_sum/context->weightData.weight_cnt;
+        context->val /= avg_weight;
+    }
+
+    return AvgFinalize(context, value);
+}
+
+void WAvgReset(void *contextPtr, timestamp_t startTS, timestamp_t endTS) {
+    _WAvginitContext(contextPtr, &startTS, &endTS);
+}
+
+void WAvgWriteContext(void *contextPtr, RedisModuleIO *io) {
+    WAvgContext *context = (WAvgContext *)contextPtr;
+    AvgWriteContext(&wcontext->avgContext, io);
+    RedisModule_SaveDouble(io, context->weightData.weightSum);
+    RedisModule_SaveUnsigned(io, context->weightData.prevPrevTS);
+    RedisModule_SaveUnsigned(io, context->weightData.prevTS);
+    RedisModule_SaveDouble(io, context->weightData.prevValue);
+    RedisModule_SaveUnsigned(io, context->weightData.bucketStartTS);
+    RedisModule_SaveUnsigned(io, context->weightData.bucketEndTS);
+    RedisModule_SaveUnsigned(io, context->weightData.is_first_bucket);
+    RedisModule_SaveUnsigned(io, context->weightData.is_last_ts_handled);
+    RedisModule_SaveUnsigned(io, context->weightData.weight_cnt);
+    RedisModule_SaveUnsigned(io, context->weightData.weight_sum);    
+}
+
+int WAvgReadContext(void *contextPtr, RedisModuleIO *io, int encver) {
+    AvgContext *context = (AvgContext *)contextPtr;
+    if(AvgReadContext(&wcontext->avgContext, io, encver) == TSDB_ERROR) {
+        goto err;
+    }
+
+    context->weightSum = LoadDouble_IOError(io, goto err);
+    context->prevPrevTS = LoadUnsigned_IOError(io, goto err);
+    context->prevTS = LoadUnsigned_IOError(io, goto err);
+    context->prevValue = LoadDouble_IOError(io, goto err);
+    context->bucketStartTS = LoadUnsigned_IOError(io, goto err);
+    context->bucketEndTS = LoadUnsigned_IOError(io, goto err);
+    context->is_first_bucket = LoadUnsigned_IOError(io, goto err);
+    context->is_last_ts_handled = LoadUnsigned_IOError(io, goto err);
+    context->weight_cnt = LoadUnsigned_IOError(io, goto err);
+    context->weight_sum = LoadUnsigned_IOError(io, goto err);
+    return TSDB_OK;
+err:
+    return TSDB_ERROR;
+}
+
 void *StdCreateContext() {
     StdContext *context = (StdContext *)malloc(sizeof(StdContext));
     context->cnt = 0;
@@ -179,7 +415,7 @@ void *StdCreateContext() {
     return context;
 }
 
-void StdAddValue(void *contextPtr, double value) {
+void StdAddValue(void *contextPtr, double value, __attribute__((unused)) timestamp_t ts) {
     StdContext *context = (StdContext *)contextPtr;
     ++context->cnt;
     context->sum += value;
@@ -267,12 +503,26 @@ void rm_free(void *ptr) {
     free(ptr);
 }
 
+static AggregationClass waggAvg = { .createContext = WAvgCreateContext,
+                                   .appendValue = WAvgAddValue,
+                                   .freeContext = rm_free,
+                                   .finalize = WAvgFinalize,
+                                   .writeContext = WAvgWriteContext,
+                                   .readContext = WAvgReadContext,
+                                   .addBucketParams = WAvgAddBucketParams,
+                                   .addPrevBucketLastSample = WAvgAddPrevBucketLastSample,
+                                   .addNextBucketFirstSample = WAvgAddNextBucketFirstSample,
+                                   .resetContext = WAvgReset };
+
 static AggregationClass aggAvg = { .createContext = AvgCreateContext,
                                    .appendValue = AvgAddValue,
                                    .freeContext = rm_free,
                                    .finalize = AvgFinalize,
                                    .writeContext = AvgWriteContext,
                                    .readContext = AvgReadContext,
+                                   .addBucketParams = NULL,
+                                   .addPrevBucketLastSample = NULL,
+                                   .addNextBucketFirstSample = NULL,
                                    .resetContext = AvgReset };
 
 static AggregationClass aggStdP = { .createContext = StdCreateContext,
@@ -281,6 +531,9 @@ static AggregationClass aggStdP = { .createContext = StdCreateContext,
                                     .finalize = StdPopulationFinalize,
                                     .writeContext = StdWriteContext,
                                     .readContext = StdReadContext,
+                                    .addBucketParams = NULL,
+                                    .addPrevBucketLastSample = NULL,
+                                    .addNextBucketFirstSample = NULL,
                                     .resetContext = StdReset };
 
 static AggregationClass aggStdS = { .createContext = StdCreateContext,
@@ -289,6 +542,9 @@ static AggregationClass aggStdS = { .createContext = StdCreateContext,
                                     .finalize = StdSamplesFinalize,
                                     .writeContext = StdWriteContext,
                                     .readContext = StdReadContext,
+                                    .addBucketParams = NULL,
+                                    .addPrevBucketLastSample = NULL,
+                                    .addNextBucketFirstSample = NULL,
                                     .resetContext = StdReset };
 
 static AggregationClass aggVarP = { .createContext = StdCreateContext,
@@ -297,6 +553,9 @@ static AggregationClass aggVarP = { .createContext = StdCreateContext,
                                     .finalize = VarPopulationFinalize,
                                     .writeContext = StdWriteContext,
                                     .readContext = StdReadContext,
+                                    .addBucketParams = NULL,
+                                    .addPrevBucketLastSample = NULL,
+                                    .addNextBucketFirstSample = NULL,
                                     .resetContext = StdReset };
 
 static AggregationClass aggVarS = { .createContext = StdCreateContext,
@@ -305,6 +564,9 @@ static AggregationClass aggVarS = { .createContext = StdCreateContext,
                                     .finalize = VarSamplesFinalize,
                                     .writeContext = StdWriteContext,
                                     .readContext = StdReadContext,
+                                    .addBucketParams = NULL,
+                                    .addPrevBucketLastSample = NULL,
+                                    .addNextBucketFirstSample = NULL,
                                     .resetContext = StdReset };
 
 void *MaxMinCreateContext() {
@@ -315,7 +577,7 @@ void *MaxMinCreateContext() {
     return context;
 }
 
-void MaxMinAppendValue(void *contextPtr, double value) {
+void MaxMinAppendValue(void *contextPtr, double value, __attribute__((unused)) timestamp_t ts) {
     MaxMinContext *context = (MaxMinContext *)contextPtr;
     if (context->isResetted) {
         context->isResetted = FALSE;
@@ -390,13 +652,13 @@ err:
     return TSDB_ERROR;
 }
 
-void SumAppendValue(void *contextPtr, double value) {
+void SumAppendValue(void *contextPtr, double value, __attribute__((unused)) timestamp_t ts) {
     SingleValueContext *context = (SingleValueContext *)contextPtr;
     context->value += value;
     context->isResetted = FALSE;
 }
 
-void CountAppendValue(void *contextPtr, double value) {
+void CountAppendValue(void *contextPtr, double value, __attribute__((unused)) timestamp_t ts) {
     SingleValueContext *context = (SingleValueContext *)contextPtr;
     context->value++;
     context->isResetted = FALSE;
@@ -408,7 +670,7 @@ int CountFinalize(void *contextPtr, double *val) {
     return TSDB_OK;
 }
 
-void FirstAppendValue(void *contextPtr, double value) {
+void FirstAppendValue(void *contextPtr, double value, __attribute__((unused)) timestamp_t ts) {
     SingleValueContext *context = (SingleValueContext *)contextPtr;
     if (context->isResetted) {
         context->isResetted = FALSE;
@@ -416,7 +678,7 @@ void FirstAppendValue(void *contextPtr, double value) {
     }
 }
 
-void LastAppendValue(void *contextPtr, double value) {
+void LastAppendValue(void *contextPtr, double value, __attribute__((unused)) timestamp_t ts) {
     SingleValueContext *context = (SingleValueContext *)contextPtr;
     context->value = value;
     context->isResetted = FALSE;
@@ -428,6 +690,9 @@ static AggregationClass aggMax = { .createContext = MaxMinCreateContext,
                                    .finalize = MaxFinalize,
                                    .writeContext = MaxMinWriteContext,
                                    .readContext = MaxMinReadContext,
+                                   .addBucketParams = NULL,
+                                   .addPrevBucketLastSample = NULL,
+                                   .addNextBucketFirstSample = NULL,
                                    .resetContext = MaxMinReset };
 
 static AggregationClass aggMin = { .createContext = MaxMinCreateContext,
@@ -436,6 +701,9 @@ static AggregationClass aggMin = { .createContext = MaxMinCreateContext,
                                    .finalize = MinFinalize,
                                    .writeContext = MaxMinWriteContext,
                                    .readContext = MaxMinReadContext,
+                                   .addBucketParams = NULL,
+                                   .addPrevBucketLastSample = NULL,
+                                   .addNextBucketFirstSample = NULL,
                                    .resetContext = MaxMinReset };
 
 static AggregationClass aggSum = { .createContext = SingleValueCreateContext,
@@ -444,6 +712,9 @@ static AggregationClass aggSum = { .createContext = SingleValueCreateContext,
                                    .finalize = SingleValueFinalize,
                                    .writeContext = SingleValueWriteContext,
                                    .readContext = SingleValueReadContext,
+                                   .addBucketParams = NULL,
+                                   .addPrevBucketLastSample = NULL,
+                                   .addNextBucketFirstSample = NULL,
                                    .resetContext = SingleValueReset };
 
 static AggregationClass aggCount = { .createContext = SingleValueCreateContext,
@@ -452,6 +723,9 @@ static AggregationClass aggCount = { .createContext = SingleValueCreateContext,
                                      .finalize = CountFinalize,
                                      .writeContext = SingleValueWriteContext,
                                      .readContext = SingleValueReadContext,
+                                     .addBucketParams = NULL,
+                                     .addPrevBucketLastSample = NULL,
+                                     .addNextBucketFirstSample = NULL,
                                      .resetContext = SingleValueReset };
 
 static AggregationClass aggFirst = { .createContext = SingleValueCreateContext,
@@ -460,6 +734,9 @@ static AggregationClass aggFirst = { .createContext = SingleValueCreateContext,
                                      .finalize = SingleValueFinalize,
                                      .writeContext = SingleValueWriteContext,
                                      .readContext = SingleValueReadContext,
+                                     .addBucketParams = NULL,
+                                     .addPrevBucketLastSample = NULL,
+                                     .addNextBucketFirstSample = NULL,
                                      .resetContext = SingleValueReset };
 
 static AggregationClass aggLast = { .createContext = SingleValueCreateContext,
@@ -468,6 +745,9 @@ static AggregationClass aggLast = { .createContext = SingleValueCreateContext,
                                     .finalize = SingleValueFinalize,
                                     .writeContext = SingleValueWriteContext,
                                     .readContext = SingleValueReadContext,
+                                    .addBucketParams = NULL,
+                                    .addPrevBucketLastSample = NULL,
+                                    .addNextBucketFirstSample = NULL,
                                     .resetContext = SingleValueReset };
 
 static AggregationClass aggRange = { .createContext = MaxMinCreateContext,
@@ -476,6 +756,9 @@ static AggregationClass aggRange = { .createContext = MaxMinCreateContext,
                                      .finalize = RangeFinalize,
                                      .writeContext = MaxMinWriteContext,
                                      .readContext = MaxMinReadContext,
+                                     .addBucketParams = NULL,
+                                     .addPrevBucketLastSample = NULL,
+                                     .addNextBucketFirstSample = NULL,
                                      .resetContext = MaxMinReset };
 
 int StringAggTypeToEnum(const char *agg_type) {

@@ -15,10 +15,13 @@ typedef struct AggregationClass
 {
     void *(*createContext)();
     void (*freeContext)(void *context);
-    void (*appendValue)(void *context, double value);
+    void (*appendValue)(void *context, double value, timestamp_t ts);
     void (*resetContext)(void *context);
     void (*writeContext)(void *context, RedisModuleIO *io);
     int (*readContext)(void *context, RedisModuleIO *io, int encver);
+    void (*addBucketParams)(void *contextPtr, timestamp_t bucketStartTS, timestamp_t bucketEndTS);
+    void (*addPrevBucketLastSample)(void *contextPtr, double value, timestamp_t ts);
+    void (*addNextBucketFirstSample)(void *contextPtr, double value, timestamp_t ts);
     int (*finalize)(void *context, double *value);
 } AggregationClass;
 

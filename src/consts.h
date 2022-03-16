@@ -89,10 +89,20 @@ typedef enum {
 #define UNCOMPRESSED_ARG_STR "uncompressed"
 #define COMPRESSED_GORILLA_ARG_STR "compressed"
 
+// DC - Don't Care (Arbitrary value) 
+#define DC 0
+
 #define SAMPLES_TO_BYTES(size) (size * sizeof(Sample))
 
 #define min(a,b) (((a)<(b))?(a):(b))
 
 #define max(a,b) (((a)>(b))?(a):(b))
+
+#define SWAP(x,y) do {   \
+  typeof(x) _x = x;      \
+  typeof(y) _y = y;      \
+  x = _y;                \
+  y = _x;                \
+} while(0)
 
 #endif

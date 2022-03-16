@@ -1000,7 +1000,7 @@ int SeriesCalcRange(Series *series,
     bool _is_empty = true;
 
     while (SeriesIteratorGetNext(iterator, &sample) == CR_OK) {
-        aggObject->appendValue(context, sample.value);
+        aggObject->appendValue(context, sample.value, sample.timestamp);
         _is_empty = false;
     }
     if (is_empty) {
