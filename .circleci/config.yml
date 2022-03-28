@@ -236,6 +236,9 @@ commands:
       profile_env:
         type: string
         default: "0"
+      keep_env:
+        type: string
+        default: "0"
       triggering_env:
         type: string
         default: "circleci"
@@ -265,6 +268,7 @@ commands:
             export AWS_DEFAULT_REGION=$PERFORMANCE_EC2_REGION
             export EC2_PRIVATE_PEM=$PERFORMANCE_EC2_PRIVATE_PEM
             export PROFILE=<< parameters.profile_env >>
+            export KEEP_ENV=<< parameters.keep_env >>
             export BENCHMARK_GLOB=<< parameters.benchmark_glob >>
             export PERF_CALLGRAPH_MODE="dwarf"
             redisbench-admin run-remote \
@@ -525,6 +529,7 @@ jobs:
       - benchmark-automation:
           allowed_envs: "oss-cluster"
           allowed_setups: "oss-cluster-30-primaries"
+          keep_env: "1" # revert me before merging
           timeout: 90m
           benchmark_glob: "tsbs-scale100*.yml"
 
